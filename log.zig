@@ -45,14 +45,15 @@ pub const Table = struct {
         };
     }
 
-    pub fn iterator(self: *const Table) Iterator {
-        return .{ .table = self };
+    pub fn iterator(self: *const Table, filter: Iterator.Message.Filter) Iterator {
+        return .{ .table = self, .filter = filter };
     }
 
     pub const Iterator = struct {
         table: *const Table,
         index: usize = 0,
         start: usize = 0,
+        filter: Message.Filter,
 
         pub const Message = struct {
             meta: ?Meta,
@@ -64,6 +65,34 @@ pub const Table = struct {
                 chan: Channel,
                 unknown: u8,
                 pad: u16 = 0,
+            };
+
+            pub const FilterInt = @Type(.{ .Int = .{
+                .signedness = .unsigned,
+                .bits = @bitSizeOf(Filter),
+            } });
+
+            pub const Filter = blk: {
+                const StructField = std.builtin.Type.StructField;
+                const info = @typeInfo(Channel).Enum.fields;
+
+                var fields: [info.len]StructField = undefined;
+                for (&fields, info) |*field, src| {
+                    field.* = .{
+                        .name = src.name,
+                        .type = bool,
+                        .alignment = 0,
+                        .default_value = &false,
+                        .is_comptime = false,
+                    };
+                }
+
+                break :blk @Type(.{ .Struct = .{
+                    .layout = .Packed,
+                    .fields = &fields,
+                    .decls = &.{},
+                    .is_tuple = false,
+                } });
             };
 
             pub const Channel = enum(u8) {
@@ -92,81 +121,155 @@ pub const Table = struct {
                 obtain = 0x3e,
                 exp = 0x40,
                 roll = 0x41,
-                login = 0x45,
+                free_company_event = 0x45,
                 outgoing_damage = 0xa9,
                 outgoing_miss = 0xaa,
                 begin_cast = 0xab,
                 buff = 0xae,
                 effect = 0xaf,
                 defeated = 0xba,
-                _,
+                self_lose_effect = 0xb0,
+                lose_effect = 0x30,
+                recover_from_effect = 0xb1,
+                recruiting = 0x48,
+                self_recover_hp = 0xad,
+                login = 0x46,
+                recovers = 0x31,
+                self_obtain = 0xbe,
+
+                npc_yell = 0x44, // maybe?
+
+                /// observed: accept, complete
+                quest = 0xb9,
+                unknown_2 = 0x1c,
+                unknown_3 = 0x42,
+                unknown_5 = 0xac,
             };
         };
 
         pub fn next(self: *Iterator) ?Message {
-            if (self.index >= self.table.offsets.len) return null;
+            const int = @bitCast(Message.FilterInt, self.filter);
 
-            defer self.index += 1;
-            const end = self.table.offsets[self.index];
-            defer self.start = end;
+            while (true) {
+                if (self.index >= self.table.offsets.len) return null;
 
-            const triple = self.table.pool[self.start..end];
-            var it = mem.split(u8, triple, "\x1f");
+                defer self.index += 1;
+                const end = self.table.offsets[self.index];
+                defer self.start = end;
 
-            const meta = it.next().?;
-            const name = it.next().?;
-            const text = it.next().?;
+                const triple = self.table.pool[self.start..end];
+                var it = mem.split(u8, triple, "\x1f");
 
-            return .{
-                .meta = if (meta.len < 8) null else @bitCast(Message.Meta, meta[0..8].*),
-                .name = name,
-                .text = text,
-            };
+                const meta = it.next().?;
+                const name = it.next().?;
+                const text = it.next().?;
+
+                if (meta.len < 8) {
+                    if (int == 0) return .{
+                        .meta = null,
+                        .name = name,
+                        .text = text,
+                    };
+                } else {
+                    const m = @bitCast(Message.Meta, meta[0..8].*);
+
+                    // std.debug.print("tag: {[tag]d} {[tag]x}\n", .{ .tag = @enumToInt(m.chan) });
+                    const cont = if (int == 0) true else switch (m.chan) {
+                        inline else => |tag| @field(self.filter, @tagName(tag)),
+                    };
+
+                    if (cont) return .{
+                        .meta = m,
+                        .name = name,
+                        .text = text,
+                    };
+                }
+            }
         }
     };
 };
 
-pub fn main() !void {
+fn help(flag: ?[]const u8) !u8 {
+    const stderr = std.io.getStdErr().writer();
+
+    if (flag) |unknown| {
+        try stderr.print(
+            \\unknown option: {s}
+            \\
+        , .{unknown});
+    }
+
+    try stderr.writeAll(
+        \\usage: log [options] files
+        \\
+        \\
+    );
+
+    inline for (@typeInfo(Table.Iterator.Message.Filter).Struct.fields) |field| {
+        try stderr.writeAll("  --" ++ field.name ++ "\n");
+    }
+
+    return @boolToInt(flag != null);
+}
+
+pub fn main() !u8 {
     var instance = std.heap.GeneralPurposeAllocator(.{}){};
     defer assert(!instance.deinit());
     const gpa = instance.allocator();
 
-    for (std.os.argv[1..]) |arg| {
-        var table = try Table.load(gpa, mem.span(arg));
+    const argv = try std.process.argsAlloc(gpa);
+    defer std.process.argsFree(gpa, argv);
+
+    var flags: Table.Iterator.Message.Filter = .{};
+
+    var buffer = std.io.bufferedWriter(std.io.getStdOut().writer());
+    const stdout = buffer.writer();
+
+    cont: for (argv[1..]) |arg| {
+        if (mem.eql(u8, arg, "--")) break;
+        if (mem.startsWith(u8, arg, "--")) {
+            const flag = arg["--".len..];
+            inline for (@typeInfo(Table.Iterator.Message.Filter).Struct.fields) |field| {
+                if (mem.eql(u8, flag, field.name)) {
+                    @field(flags, field.name) = true;
+                    continue :cont;
+                }
+            }
+
+            return try help(flag);
+        }
+    }
+
+    var ignore_flags = false;
+    for (argv[1..]) |arg| {
+        if (!ignore_flags and mem.startsWith(u8, arg, "--")) {
+            if (mem.eql(u8, arg, "--")) ignore_flags = true;
+            continue;
+        }
+
+        var table = try Table.load(gpa, arg);
         defer table.deinit(gpa);
 
-        var it = table.iterator();
+        var it = table.iterator(flags);
 
         while (it.next()) |message| if (message.meta) |meta| {
-            switch (meta.chan) {
-                .outgoing_miss,
-                .outgoing_damage,
-                .incoming_miss,
-                .incoming_damage,
-                .defeat,
-                .begin_cast,
-                .effect,
-                .cast,
-                .defeated,
-                .recover_hp,
-                .player_buff,
-                .buff,
-                .status_effect,
-                => std.debug.print(
-                    \\time: {d}
-                    \\chan: {}
-                    \\name: {s}
-                    \\text: {s}
-                    \\
-                    \\
-                , .{
-                    meta.time,
-                    meta.chan,
-                    message.name,
-                    message.text,
-                }),
-                else => {},
-            }
+            try stdout.print(
+                \\time: {d}
+                \\chan: {}
+                \\name: {s}
+                \\text: {s}
+                \\
+                \\
+            , .{
+                meta.time,
+                meta.chan,
+                message.name,
+                esc(message.text),
+            });
         };
     }
+
+    try buffer.flush();
+
+    return 0;
 }
